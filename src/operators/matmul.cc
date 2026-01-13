@@ -1,4 +1,7 @@
 #include "operators/matmul.h"
+#include "core/common.h"
+#include "core/runtime.h"
+#include "utils/operator_utils.h"
 
 namespace infini
 {
@@ -27,7 +30,30 @@ namespace infini
         // TODO：返回经过 matmul 操作后的 shape
         // REF: https://github.com/onnx/onnx/blob/main/docs/Operators.md#gemm
         // =================================== 作业 ===================================
-        return std::nullopt;
+
+        const auto& lhs = inputs[0];
+        const auto& rhs = inputs[1];
+
+        Shape lhs_shape = lhs->getDims();
+        Shape rhs_shape = rhs->getDims();
+        IT_ASSERT(lhs_shape.size() == rhs_shape.size() &&
+                  lhs_shape.size() >= 2);
+
+        const int n = lhs_shape[lhs_shape.size() - (transA ? 1 : 2)];
+        const int m = rhs_shape[rhs_shape.size() - (transB ? 2 : 1)];
+        IT_ASSERT(lhs_shape[lhs_shape.size() - (transA ? 2 : 1)] ==
+                  rhs_shape[rhs_shape.size() - (transB ? 1 : 2)]);
+
+        lhs_shape.pop_back();
+        lhs_shape.pop_back();
+        rhs_shape.pop_back();
+        rhs_shape.pop_back();
+
+        Shape retval = infer_broadcast(lhs_shape, rhs_shape);
+        retval.push_back(n);
+        retval.push_back(m);
+
+        return {{retval}};
     }
 
-} // namespace infini
+    } // namespace infini
