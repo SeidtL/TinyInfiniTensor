@@ -1,6 +1,7 @@
 #pragma once
 #include "core/allocator.h"
 #include "core/operator.h"
+#include "core/runtime.h"
 #include "core/tensor.h"
 #include <algorithm>
 #include <cstdint>
@@ -112,6 +113,16 @@ namespace infini
          */
         void addOperatorAndConnect(const Operator &op);
 
+        /// @brief Optimize redundant transpose operators.
+        /// @param op The probed operator.
+        /// @return The operators to be removed.
+        vector<Operator> eliminate_redundant_transposes(const Operator&);
+
+        /// @brief Optimize matmul and transpose operators.
+        /// @param op The probed operator.
+        /// @return The operators to be removed.
+        vector<Operator> eliminate_redundant_matmul_transpose(const Operator&);
+        void remove_output_tensors_from(const Operator&);
         /**
          * @brief If the nodes is sorted in topological order.
          */

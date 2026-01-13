@@ -1,4 +1,5 @@
 #include "operators/concat.h"
+#include "core/common.h"
 #include "utils/operator_utils.h"
 
 namespace infini {
@@ -17,6 +18,21 @@ optional<vector<Shape>> ConcatObj::inferShape(const TensorVec &inputs) {
     // TODO：修改 dims，返回正确的 concat 后的 shape
     // REF: https://onnx.ai/onnx/operators/onnx__Concat.html#concat-13
     // =================================== 作业 ===================================
+
+    auto sanity_check = [&](const Shape& shape) {
+        IT_ASSERT(shape.size() == rank);
+        for (size_t i = 0; i < rank; ++i) {
+            if (i != static_cast<size_t>(dim)) {
+                IT_ASSERT(shape[i] == dims[i]);
+            }
+        }
+    };
+
+    for (size_t i = 1; i < inputs.size(); ++i) {
+        const auto shape  = inputs[i]->getDims();
+        dims[dim]        += shape[dim];
+        sanity_check(shape);
+    }
 
     return {{dims}};
 }

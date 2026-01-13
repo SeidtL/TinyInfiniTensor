@@ -1,7 +1,13 @@
 #include "core/graph.h"
+#include "core/blob.h"
+#include "core/op_type.h"
+#include "core/ref.h"
+#include "core/runtime.h"
+#include "operators/matmul.h"
+#include "operators/transpose.h"
 #include <algorithm>
-#include <numeric>
-#include <queue>
+#include <optional>
+#include <unordered_map>
 
 namespace infini
 {
@@ -98,6 +104,144 @@ namespace infini
         return this->sorted = true;
     }
 
+    void GraphObj::remove_output_tensors_from(const Operator& op) {
+        for (auto& tensor : op->getOutputs()) {
+            removeTensor(tensor);
+        }
+    }
+
+    vector<Operator>
+    GraphObj::eliminate_redundant_transposes(const Operator& op) {
+        if (op->getOpType() != OpType::Transpose) {
+            return {};
+        }
+
+        auto pred = op->getPredecessors();
+        if (pred.size() != 1) {
+            return {};
+        }
+        if (pred[0]->getOpType() != OpType::Transpose) {
+            return {};
+        }
+
+        // ? -> t1 -> t2 -> ?
+        auto t2     = as<TransposeObj>(op);
+        auto t1     = as<TransposeObj>(pred[0]);
+        auto input  = t1->inputs[0];
+        auto output = t2->outputs[0];
+        auto p2     = t2->getPermute();
+
+        auto apply = [](const Shape& dims, const Shape& perm) -> Shape {
+            Shape modified(dims.size());
+            for (size_t i = 0; i < dims.size(); ++i) {
+                modified[i] = dims[perm[i]];
+            }
+            return modified;
+        };
+
+        // Check t2(t1(x)) == x
+        auto dims     = input->getDims();
+        auto modified = input->getDims();
+        modified      = apply(modified, t1->getPermute());
+        modified      = apply(modified, t2->getPermute());
+        for (size_t i = 0; i < dims.size(); ++i) {
+            if (dims[i] != modified[i]) {
+                return {};
+            }
+        }
+
+        // Remove t1 and t2 from graph
+        auto group_pred = t1->getPredecessors();
+        auto group_succ = t2->getSuccessors();
+        for (auto& pred : group_pred) {
+            pred->removeSuccessors(t1);
+        }
+
+        input->removeTarget(t1);
+        for (auto& succ : group_succ) {
+            succ->removePredecessors(t2);
+            for (auto& succ_inp : succ->inputs) {
+                if (succ_inp.get() == output.get()) {
+                    succ_inp = input;
+                    break;
+                }
+            }
+            input->addTarget(succ);
+        }
+
+        remove_output_tensors_from(t2);
+        remove_output_tensors_from(t1);
+
+        return {pred[0], op};
+    }
+
+    vector<Operator>
+    GraphObj::eliminate_redundant_matmul_transpose(const Operator& op) {
+        if (op->getOpType() != OpType::MatMul) {
+            return {};
+        }
+
+        auto matmul_op = as<MatmulObj>(op);
+        // matmul_op is optimized.
+        if (matmul_op->getTransA() || matmul_op->getTransB()) {
+            return {};
+        }
+
+        auto deal = [&](Tensor& tensor) -> std::optional<std::pair<Tensor, Operator>> {
+            auto source = tensor->getSource();
+            if (!source || source->getOpType() != OpType::Transpose) {
+                return {};
+            }
+
+            auto transpose_op = as<TransposeObj>(source);
+            auto perm         = transpose_op->getPermute();
+            for (size_t i = 0; i < perm.size() - 2; ++i) {
+                if (perm[i] != static_cast<int>(i)) {
+                    return {};
+                }
+            }
+
+            // Last two dimension is equal to the swapped ones.
+            if (perm[perm.size() - 1] != static_cast<int>(perm.size() - 2) ||
+                perm[perm.size() - 2] != static_cast<int>(perm.size() - 1)) {
+                return {};
+            }
+
+            auto transpose_pred = transpose_op->getPredecessors();
+            for (auto& pred : transpose_pred) {
+                pred->removeSuccessors(transpose_op);
+                matmul_op->addPredecessors(pred);
+            }
+            matmul_op->removePredecessors(transpose_op);
+            auto input = transpose_op->inputs[0];
+            input->removeTarget(transpose_op);
+            input->addTarget(matmul_op);
+            return {{input, transpose_op}};
+        };
+
+        vector<Operator> to_remove;
+        {
+            auto A = op->inputs[0];
+            auto B = op->inputs[1];
+
+            if (auto tensor_op = deal(A); tensor_op.has_value()) {
+                matmul_op->setTransA(true);
+                matmul_op->inputs[0] = std::move(tensor_op.value().first);
+                removeTensor(A);
+                to_remove.emplace_back(std::move(tensor_op.value()).second);
+            }
+
+            if (auto tensor_op = deal(B); tensor_op.has_value()) {
+                matmul_op->setTransB(true);
+                matmul_op->inputs[1] = std::move(tensor_op.value().first);
+                removeTensor(B);
+                to_remove.emplace_back(std::move(tensor_op.value()).second);
+            }
+        }
+
+        return to_remove;
+    }
+
     void GraphObj::optimize()
     {
         // =================================== 作业 ===================================
@@ -106,6 +250,27 @@ namespace infini
         // 1. 去除冗余的算子（例如，两个相邻的算子都是 transpose 算子，且做的是相反的操作，可以将其全部删除）
         // 2. 合并算子（例如，矩阵乘算子中含有属性transA、transB，如果其输入存在transpose，且对最后两个维度做交换，就可以将transpose融入到矩阵乘算子的属性中去）
         // =================================== 作业 ===================================
+
+        vector<Operator> remove_ops;
+        for (auto& op : ops) {
+            auto to_remove = eliminate_redundant_transposes(op);
+            remove_ops.insert(remove_ops.end(), to_remove.begin(),
+                              to_remove.end());
+        }
+
+        for (auto& op : remove_ops) {
+            removeOperator(op);
+        }
+
+        remove_ops.clear();
+        for (auto& op : ops) {
+            auto to_remove = eliminate_redundant_matmul_transpose(op);
+            remove_ops.insert(remove_ops.end(), to_remove.begin(),
+                              to_remove.end());
+        }
+        for (auto& op : remove_ops) {
+            removeOperator(op);
+        }
     }
 
     Tensor GraphObj::getTensor(int fuid) const
@@ -153,6 +318,24 @@ namespace infini
         // HINT: 获取分配好的内存指针后，可以调用 tensor 的 setDataBlob 函数给 tensor 绑定内存
         // =================================== 作业 ===================================
 
+        std::unordered_map<TensorObj*, size_t> objs;
+
+        for (auto& tensor : tensors) {
+            if (objs.count(tensor.get())) {
+                continue;
+            }
+
+            auto n_bytes       = tensor->getBytes();
+            objs[tensor.get()] = allocator.alloc(n_bytes);
+        }
+
+        const auto ptr = allocator.getPtr();
+
+        for (auto& [tensorObj, offset] : objs) {
+            auto obj_ptr = static_cast<char*>(ptr) + offset;
+            auto data    = infini::make_ref<BlobObj>(runtime, obj_ptr);
+            tensorObj->setDataBlob(data);
+        }
         allocator.info();
     }
 
@@ -227,4 +410,4 @@ namespace infini
         return true;
     }
 
-} // namespace infini
+    } // namespace infini

@@ -34,7 +34,10 @@ namespace infini
         // REF: https://onnx.ai/onnx/operators/onnx__Transpose.html#transpose-21
         // =================================== 作业 ===================================
 
-        return std::nullopt;
+        for (auto i = 0; i < rank; ++i) {
+            output_dim[i] = input_dim[transposePermute[i]];
+        }
+        return {{output_dim}};
     }
 
     std::string TransposeObj::toString() const
